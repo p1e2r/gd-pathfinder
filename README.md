@@ -19,15 +19,40 @@ The search doesn't save deaths, percentages or a completion. It does count attem
 
 ## How it works
 
+There are two search strategies (setting *Strategy*).
+
+### Lookahead (default)
+
+The approach is the same as [camila314/pathfinder](https://github.com/camila314/pathfinder)'s.
+This is a separate implementation (that project isn't licensed for redistribution), and it
+runs the real game instead of a standalone physics simulator. Slower per try, but every
+2.2 object and trigger behaves exactly like in-game.
+
+- From the committed point, try up to *tries per step* random patterns of *flips per try*
+  button flips spread over the next *ticks ahead* ticks. The first try of each step adds
+  no flips.
+- Keep the try that survives longest. Stop early once one survives half the lookahead.
+- Commit the first third of it, snapshot there, and repeat.
+- If no try gets 12+ ticks further, roll back. The distance grows each time (+5 ticks,
+  then +55 past 100), never past *furthest point − cap*. The cap grows by 1000 ticks after
+  repeated failures. Past 10000 the search restarts from the beginning (next round). It
+  never gives up.
+
+### Exhaustive
+
+
 Physics runs at a fixed 240 ticks per second, so a path is just a list of ticks where
 the jump button flips. The bot runs many ticks per rendered frame (see *Time per frame*).
 
 - **Run** with the current path until the player dies at tick `d`. Deaths are caught in
   `PlayLayer::destroyPlayer` and never happen in the game.
-- **Branch**: try one new flip at `d-1, d-2, …` down to `d - window` (closest first). Each
-  try rewinds to the nearest snapshot and simulates forward. If that try dies later, it
-  gets its own window. That makes a depth-first search over click timings.
+- **Scan**: try one new flip at `d-1, d-2, …` down to `d - window`. Each try rewinds to the
+  nearest snapshot and simulates forward. A try that gets past `d` is followed right away.
+  The rest are kept and expanded afterwards, furthest death first.
 - **Backtrack**: when a window runs out it widens once, then the search goes up a level.
+- **Stall budget**: a branch that goes *Stall budget* tries without a new best is abandoned,
+  and the level above it gets twice the room. If everything runs out, the search restarts
+  with 4× the budget (round 2, 3, …) instead of giving up.
 - **Prune**: a try that dies at exactly the same tick and place as one already seen is
   not expanded (*Skip identical deaths*).
 - **Snapshots** combine GD's `CheckpointObject` (level state) with a full member-by-member
@@ -46,9 +71,12 @@ uses for non-xdBot macros.
 | Setting | Default | Notes |
 |---|---|---|
 | Start / stop | Alt+J | |
+| Strategy | Lookahead | Lookahead or Exhaustive |
+| Lookahead: ticks ahead / tries per step / flips per try | 1000 / 300 / 30 | |
 | Search window | 60 ticks | How far before a death to try new inputs |
 | Tick step | 1 | Try every Nth tick in the window |
 | Skip identical deaths | on | Big speedup; turn off if it gives up too early |
+| Stall budget | 300 tries | Tries without a new best before a branch is dropped |
 | Exact mode | off | Bit-exact but slow on long levels |
 | Time per frame | 14 ms | Search speed vs. smoothness |
 | Snapshot every N ticks / Max snapshots | 4 / 400 | Memory vs. rewind speed |

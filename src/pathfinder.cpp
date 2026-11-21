@@ -32,6 +32,11 @@ void Pathfinder::readSettings() {
     m_seed = static_cast<int>(mod->getSettingValue<int64_t>("seed"));
     m_exact = mod->getSettingValue<bool>("exact_mode");
     m_dedupe = mod->getSettingValue<bool>("dedupe_deaths");
+    m_strategy = mod->getSettingValue<std::string>("strategy") == "Exhaustive"
+        ? Strategy::Exhaustive : Strategy::Lookahead;
+    m_laTicks = std::max(60, static_cast<int>(mod->getSettingValue<int64_t>("lookahead_ticks")));
+    m_laTries = std::max(1, static_cast<int>(mod->getSettingValue<int64_t>("lookahead_tries")));
+    m_laClicks = std::max(1, static_cast<int>(mod->getSettingValue<int64_t>("lookahead_clicks")));
     m_window = std::max(m_window, 2);
     m_step = std::max(m_step, 1);
     m_snapEvery = std::max(m_snapEvery, 1);
@@ -67,12 +72,28 @@ void Pathfinder::start(PlayLayer* pl) {
     m_repairs = 0;
     m_lastTick = 0;
     m_stuckLoops = 0;
-    m_runIsChild = false;
+    m_runKind = RunKind::Root;
+    m_bottomDepth = 0;
+    m_baseBudget = static_cast<uint64_t>(Mod::get()->getSettingValue<int64_t>("branch_budget"));
+    m_budget = m_baseBudget;
+    m_budgetPopped = false;
+    m_rounds = 1;
+    m_lastLogAttempts = 0;
     m_startTime = std::chrono::steady_clock::now();
 
     m_phase = Phase::Search;
     m_pending = Pending::None;
+    m_stopAtTick = -1;
+    m_rng.seed(static_cast<uint32_t>(m_seed));
+    m_anchor = 0;
+    m_try = 0;
+    m_stepBest = 0;
+    m_stepBestSuffix.clear();
+    m_farthest = 0;
+    m_backoff = 1;
+    m_backoffCap = 1000;
     fullReset(pl);
+    if (m_strategy == Strategy::Lookahead) laBeginTry();
 
     auto label = CCLabelBMFont::create("Pathfinder", "bigFont.fnt");
     label->setScale(0.3f);
@@ -197,7 +218,16 @@ void Pathfinder::afterStep(PlayLayer* pl, bool isLastTick) {
         m_restoreTick = t;
         return;
     }
-    if (isLastTick && !m_exact && t > 0 && t % m_snapEvery == 0 && !m_snaps.contains(t))
+    if (m_stopAtTick >= 0 && t >= m_stopAtTick) {
+        // snapshot before this tick's inputs, like every other snapshot
+        if (m_laRun == LaRun::Commit && !m_exact && !m_snaps.contains(t)) takeSnapshot(pl, t);
+        m_pending = Pending::Reached;
+        m_restoreTick = t;
+        return;
+    }
+    // lookahead keeps snapshots only at committed points (plus clean verify runs)
+    bool periodic = m_strategy == Strategy::Exhaustive || m_phase == Phase::Verify;
+    if (periodic && isLastTick && !m_exact && t > 0 && t % m_snapEvery == 0 && !m_snaps.contains(t))
         takeSnapshot(pl, t);
     applyInputsAt(pl, t);
 }
@@ -214,6 +244,7 @@ bool Pathfinder::beginTick(PlayLayer* pl, std::chrono::steady_clock::time_point 
             case Pending::Died: onDeath(pl, m_restoreTick); break;
             case Pending::Won: onWin(pl, m_restoreTick); break;
             case Pending::Restore: restoreTo(pl, m_restoreTick); break;
+            case Pending::Reached: laOnReached(pl, m_restoreTick); break;
         }
     }
     return false;
@@ -267,11 +298,62 @@ float Pathfinder::percentOf(PlayLayer* pl) const {
     return std::clamp(pl->m_player1->getPositionX() / pl->m_levelLength * 100.f, 0.f, 100.f);
 }
 
+void Pathfinder::pushFrame(int d) {
+    if (m_stack.empty()) m_bottomDepth = m_toggles.size();
+    Frame f;
+    f.depth = m_toggles.size();
+    f.base = m_toggles.empty() ? 0 : m_toggles.back();
+    f.death = d;
+    f.nextT = d - 1;
+    f.low = std::max({f.base + 1, d - m_window, 1});
+    f.budget = m_budget;
+    m_stack.push_back(std::move(f));
+}
+
+void Pathfinder::runToggle(size_t depth, int t, RunKind kind) {
+    m_toggles.resize(depth);
+    m_toggles.push_back(t);
+    m_runToggle = t;
+    m_runKind = kind;
+    m_restoreTick = t;
+    m_pending = Pending::Restore;
+}
+
 void Pathfinder::onDeath(PlayLayer* pl, int d) {
     ++m_attempts;
+    for (auto& f : m_stack) ++f.spent;
+
     if (d > m_bestTick) {
         m_bestTick = d;
         m_bestPercent = std::max(m_bestPercent, percentOf(pl));
+        // progress: every open branch gets a fresh allowance
+        for (auto& f : m_stack) { f.spent = 0; f.budget = m_budget; }
+    }
+
+    if (m_attempts - m_lastLogAttempts >= 1000) {
+        m_lastLogAttempts = m_attempts;
+        auto secs = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - m_startTime).count());
+        log::info("{} tries ({}/s), best {:.2f}% (tick {}), depth {}, round {}, budget {}",
+            m_attempts, m_attempts / secs, m_bestPercent, m_bestTick, m_stack.size(), m_rounds, m_budget);
+    }
+
+    if (m_strategy == Strategy::Lookahead) {
+        if (m_phase == Phase::Search) return laEndTry(pl, d);
+        if (++m_repairs > m_maxRepairs) {
+            stop(pl);
+            FLAlertLayer::create("Pathfinder",
+                fmt::format("The found path didn't survive a clean replay after {} repairs. "
+                    "Try <cy>Exact mode</c> in the mod settings.", m_maxRepairs), "OK")->show();
+            return;
+        }
+        // drifted on the clean replay: keep what worked and plan again from a bit before
+        log::info("verify died at tick {}, repair {}", d, m_repairs);
+        m_phase = Phase::Search;
+        m_farthest = 0;
+        m_backoff = 1;
+        m_backoffCap = 1000;
+        return laMoveAnchor(pl, std::max(0, d - m_laTicks / 4));
     }
 
     if (m_phase == Phase::Verify) {
@@ -288,17 +370,27 @@ void Pathfinder::onDeath(PlayLayer* pl, int d) {
         m_phase = Phase::Search;
         m_toggles.erase(std::lower_bound(m_toggles.begin(), m_toggles.end(), d), m_toggles.end());
         m_stack.clear();
-        int base = m_toggles.empty() ? 0 : m_toggles.back();
-        m_stack.push_back({m_toggles.size(), base, d, d - 1, std::max({base + 1, d - m_window, 1})});
         m_deathSigs.insert(deathSignature(pl, d));
+        pushFrame(d);
     } else {
         uint64_t sig = deathSignature(pl, d);
         bool seen = !m_deathSigs.insert(sig).second;
-        // a new toggle that ends in exactly the same death changed nothing; its children
-        // would repeat the parent's own candidates
-        if (!(m_runIsChild && m_dedupe && seen)) {
-            int base = m_toggles.empty() ? 0 : m_toggles.back();
-            m_stack.push_back({m_toggles.size(), base, d, d - 1, std::max({base + 1, d - m_window, 1})});
+
+        switch (m_runKind) {
+            case RunKind::Root:
+                pushFrame(d);
+                break;
+            case RunKind::Scan: {
+                // the same death as a run already seen: this toggle changed nothing
+                if (m_dedupe && seen) break;
+                Frame& f = m_stack.back();
+                if (d > f.death) pushFrame(d); // got further than the parent: dive now
+                else f.deferred.push_back({m_runToggle, d});
+                break;
+            }
+            case RunKind::Expand:
+                pushFrame(d);
+                break;
         }
     }
 
@@ -313,37 +405,174 @@ void Pathfinder::onDeath(PlayLayer* pl, int d) {
 bool Pathfinder::advance() {
     while (true) {
         if (m_stack.empty()) {
-            if (m_toggles.empty()) return false;
+            m_toggles.resize(std::min(m_toggles.size(), m_bottomDepth));
+            if (m_toggles.empty()) {
+                if (!m_budgetPopped) return false; // really exhausted
+                // every branch ran out of budget: start over with a bigger one
+                m_budgetPopped = false;
+                m_budget *= 4;
+                ++m_rounds;
+                m_deathSigs.clear();
+                log::info("round {}: budget {} tries per branch", m_rounds, m_budget);
+                m_runKind = RunKind::Root;
+                m_restoreTick = 0;
+                m_pending = Pending::Restore;
+                return true;
+            }
             // after a repair the stack only covers the newest segment; to go further back,
             // reopen the decision that placed the last toggle
             int last = m_toggles.back();
             m_toggles.pop_back();
-            int base = m_toggles.empty() ? 0 : m_toggles.back();
-            m_stack.push_back({m_toggles.size(), base, last + 1, last - 1, std::max({base + 1, last - m_window, 1})});
+            pushFrame(last + 1);
+            m_stack.back().nextT = last - 1;
             continue;
         }
 
         Frame& f = m_stack.back();
-        if (f.nextT < f.low) {
+        if (f.spent > f.budget) {
+            // stuck in this branch: give it up, and give the parent more room
+            uint64_t spent = f.spent;
+            m_stack.pop_back();
+            m_budgetPopped = true;
+            if (!m_stack.empty()) {
+                auto& parent = m_stack.back();
+                parent.budget = std::max(parent.budget, spent + f.budget * 2);
+            }
+            continue;
+        }
+
+        if (f.scanning) {
+            if (f.nextT >= f.low) {
+                int t = f.nextT;
+                f.nextT -= m_step;
+                runToggle(f.depth, t, RunKind::Scan);
+                return true;
+            }
             if (!f.widened && f.low > f.base + 1) {
                 f.widened = true;
                 f.nextT = f.low - 1;
                 f.low = std::max(f.base + 1, f.low - 3 * m_window);
                 continue;
             }
-            m_stack.pop_back();
-            continue;
+            f.scanning = false;
+            // expand the toggles that got furthest first
+            std::stable_sort(f.deferred.begin(), f.deferred.end(),
+                [](Candidate const& a, Candidate const& b) { return a.death > b.death; });
         }
 
-        int t = f.nextT;
-        f.nextT -= m_step;
-        m_toggles.resize(f.depth);
-        m_toggles.push_back(t);
-        m_restoreTick = t;
-        m_pending = Pending::Restore;
-        m_runIsChild = true;
-        return true;
+        if (f.expandIdx < f.deferred.size()) {
+            auto c = f.deferred[f.expandIdx++];
+            runToggle(f.depth, c.t, RunKind::Expand);
+            return true;
+        }
+        m_stack.pop_back();
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Random lookahead. From the committed point, try random sets of button flips
+// over the next m_laTicks ticks and keep the one that survives longest. Commit
+// the first third of it and go again. If no try gets anywhere, roll back a
+// growing distance; after enough failures, start over from the beginning.
+
+void Pathfinder::laBeginTry() {
+    size_t committed = std::lower_bound(m_toggles.begin(), m_toggles.end(), m_anchor) - m_toggles.begin();
+    m_toggles.resize(committed);
+    if (m_try > 0) {
+        // the first try of a step changes nothing; the rest are random
+        std::uniform_int_distribution<int> dist(m_anchor + 1, m_anchor + m_laTicks);
+        std::vector<int> suffix;
+        suffix.reserve(m_laClicks);
+        for (int i = 0; i < m_laClicks; ++i) suffix.push_back(dist(m_rng));
+        std::sort(suffix.begin(), suffix.end());
+        suffix.erase(std::unique(suffix.begin(), suffix.end()), suffix.end());
+        m_toggles.insert(m_toggles.end(), suffix.begin(), suffix.end());
+    }
+    m_laRun = LaRun::Try;
+    m_stopAtTick = m_anchor + m_laTicks;
+    m_restoreTick = m_anchor;
+    m_pending = Pending::Restore;
+}
+
+void Pathfinder::laEndTry(PlayLayer* pl, int end) {
+    if (end > m_stepBest) {
+        m_stepBest = end;
+        size_t committed = std::lower_bound(m_toggles.begin(), m_toggles.end(), m_anchor) - m_toggles.begin();
+        m_stepBestSuffix.assign(m_toggles.begin() + committed, m_toggles.end());
+    }
+    ++m_try;
+    bool goodEnough = m_stepBest - m_anchor >= m_laTicks / 2 && m_backoff < 1000;
+    if (goodEnough || m_try >= m_laTries) laFinishStep(pl);
+    else laBeginTry();
+}
+
+void Pathfinder::laFinishStep(PlayLayer* pl) {
+    static constexpr int kMinProgress = 12; // ticks; less than this counts as stuck
+
+    if (m_stepBest - m_anchor >= kMinProgress) {
+        int commit = m_anchor + std::max(1, (m_stepBest - m_anchor) / 3);
+        size_t committed = std::lower_bound(m_toggles.begin(), m_toggles.end(), m_anchor) - m_toggles.begin();
+        m_toggles.resize(committed);
+        m_toggles.insert(m_toggles.end(), m_stepBestSuffix.begin(), m_stepBestSuffix.end());
+        return laMoveAnchor(pl, commit);
+    }
+
+    // stuck: roll back further each time, but not past m_farthest - m_backoffCap
+    int target = std::max({m_anchor - m_backoff, m_farthest - m_backoffCap, 0});
+    m_backoff += m_backoff > 100 ? 55 : 5;
+    if (m_backoff > m_backoffCap + 1000) {
+        m_backoffCap += 1000;
+        m_backoff = 1;
+        if (m_backoffCap > 10000) {
+            // nothing works from anywhere nearby: start over
+            m_backoffCap = 1000;
+            m_farthest = 0;
+            target = 0;
+            ++m_rounds;
+            log::info("round {}: restarting from the beginning", m_rounds);
+        }
+    }
+    laMoveAnchor(pl, target);
+}
+
+void Pathfinder::laMoveAnchor(PlayLayer* pl, int target) {
+    target = std::max(target, 0);
+    // toggles from target on aren't committed
+    m_toggles.erase(std::lower_bound(m_toggles.begin(), m_toggles.end(), target), m_toggles.end());
+    if (target == 0 || (!m_exact && m_snaps.contains(target))) {
+        m_snaps.erase(m_snaps.upper_bound(target), m_snaps.end());
+        m_anchor = target;
+        m_try = 0;
+        m_stepBest = m_anchor;
+        return laBeginTry();
+    }
+    // replay the committed toggles up to target, snapshot there
+    m_laRun = LaRun::Commit;
+    m_stopAtTick = target;
+    m_restoreTick = target;
+    m_pending = Pending::Restore;
+}
+
+void Pathfinder::laOnReached(PlayLayer* pl, int t) {
+    if (m_laRun == LaRun::Try) {
+        // survived the whole lookahead
+        ++m_attempts;
+        if (t > m_bestTick) {
+            m_bestTick = t;
+            m_bestPercent = std::max(m_bestPercent, percentOf(pl));
+        }
+        return laEndTry(pl, t);
+    }
+    m_anchor = t;
+    if (m_anchor > m_farthest) {
+        m_farthest = m_anchor;
+        m_backoff = 1;
+        m_backoffCap = 1000;
+    }
+    m_try = 0;
+    m_stepBest = m_anchor;
+    laBeginTry();
 }
 
 void Pathfinder::onWin(PlayLayer* pl, int t) {
@@ -356,7 +585,8 @@ void Pathfinder::onWin(PlayLayer* pl, int t) {
         m_phase = Phase::Verify;
         m_stack.clear();
         m_snaps.clear(); // search snapshots came from rewound runs
-        m_runIsChild = false;
+        m_runKind = RunKind::Root;
+        m_stopAtTick = -1;
         fullReset(pl);
         return;
     }
@@ -433,9 +663,16 @@ void Pathfinder::updateLabel(PlayLayer* pl) {
     if (!m_label) return;
     char const* what = m_phase == Phase::Verify ? "verifying" : "searching";
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - m_startTime).count();
+    if (m_strategy == Strategy::Lookahead && m_phase == Phase::Search) {
+        m_label->setString(fmt::format(
+            "Pathfinder: lookahead ({}s, round {})\nbest {:.2f}%  now {:.2f}%\ntries {} ({}/s)  step try {}/{}  rollback {}",
+            secs, m_rounds, m_bestPercent, percentOf(pl), m_attempts, m_attempts / std::max<int64_t>(1, secs),
+            m_try, m_laTries, m_backoff).c_str());
+        return;
+    }
     m_label->setString(fmt::format(
-        "Pathfinder: {} ({}s)\nbest {:.2f}%  now {:.2f}%\ntries {}  depth {}  inputs {}  snaps {}",
-        what, secs, m_bestPercent, percentOf(pl), m_attempts, m_stack.size(), m_toggles.size(), m_snaps.size()).c_str());
+        "Pathfinder: {} ({}s, round {})\nbest {:.2f}%  now {:.2f}%\ntries {} ({}/s)  depth {}  inputs {}  snaps {}",
+        what, secs, m_rounds, m_bestPercent, percentOf(pl), m_attempts, m_attempts / std::max<int64_t>(1, secs), m_stack.size(), m_toggles.size(), m_snaps.size()).c_str());
 }
 
 void Pathfinder::removeLabel() {

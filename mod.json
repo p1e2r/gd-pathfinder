@@ -5,7 +5,7 @@
 		"mac": "2.2091",
 		"android": "2.2091"
 	},
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"id": "p1e2r.pathfinder",
 	"name": "Pathfinder",
 	"developer": "p1e2r",
@@ -21,6 +21,44 @@
 		"search-title": {
 			"type": "title",
 			"name": "Search"
+		},
+		"strategy": {
+			"type": "string",
+			"name": "Strategy",
+			"one-of": [
+				"Lookahead",
+				"Exhaustive"
+			],
+			"default": "Lookahead",
+			"description": "Lookahead: tries random click patterns ahead, keeps the one that survives longest, commits the first third of it, and rolls back further when stuck. It never gives up. Exhaustive: depth-first over single click timings near each death."
+		},
+		"lookahead_ticks": {
+			"type": "int",
+			"name": "Lookahead: ticks ahead",
+			"description": "How far each try plans (240 = 1 second).",
+			"default": 1000,
+			"min": 60,
+			"max": 4800
+		},
+		"lookahead_tries": {
+			"type": "int",
+			"name": "Lookahead: tries per step",
+			"description": "Random click patterns tried before committing. Lower is faster per step but weaker on hard parts.",
+			"default": 300,
+			"min": 1,
+			"max": 5000
+		},
+		"lookahead_clicks": {
+			"type": "int",
+			"name": "Lookahead: flips per try",
+			"description": "Button presses/releases in each random pattern.",
+			"default": 30,
+			"min": 1,
+			"max": 500
+		},
+		"exhaustive-title": {
+			"type": "title",
+			"name": "Exhaustive strategy"
 		},
 		"search_window": {
 			"type": "int",
@@ -43,6 +81,14 @@
 			"name": "Skip identical deaths",
 			"description": "Don't explore a new input if it dies at exactly the same tick and place as an input already tried. Much faster; turn off if the search gives up on a level it should beat.",
 			"default": true
+		},
+		"branch_budget": {
+			"type": "int",
+			"name": "Stall budget (tries)",
+			"description": "A branch that goes this many tries without a new best is abandoned; each step further back gets twice the room. If every branch runs out, the search restarts with 4x the budget.",
+			"default": 300,
+			"min": 20,
+			"max": 100000
 		},
 		"exact_mode": {
 			"type": "bool",
@@ -114,5 +160,9 @@
 	"links": {
 		"source": "https://github.com/p1e2r/gd-pathfinder"
 	},
-	"tags": ["gameplay", "utility", "cheat"]
+	"tags": [
+		"gameplay",
+		"utility",
+		"cheat"
+	]
 }
