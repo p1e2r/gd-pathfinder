@@ -1,0 +1,90 @@
+name: Build Geode Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - name: macOS
+          os: macos-latest
+
+        - name: Windows
+          os: windows-latest
+
+        - name: Android64
+          os: ubuntu-latest
+          target: Android64
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships an MSVC STL that requires Clang 22+
+      - name: Update LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco upgrade llvm -y --no-progress
+          clang --version
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          bindings: geode-sdk/bindings
+          # pinned: src/player_state.hpp is generated from this revision
+          # (re-run tools/gen_player_state.py when bumping it)
+          bindings-ref: e9aaed407bd29fbf2fa91cc20d600be609ddc9aa
+          build-config: Release
+          combine: true
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Package builds
+    runs-on: ubuntu-latest
+    needs: ['build']
+    if: ${{ !cancelled() }}
+
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Build Output
+          path: ${{ steps.build.outputs.build-output }}
+
+  release:
+    name: Publish latest build
+    runs-on: ubuntu-latest
+    needs: ['package']
+    if: ${{ github.event_name == 'push' && needs.package.result == 'success' }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Build Output
+          path: out
+
+      - name: Replace the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest out/*.geode \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Pathfinder for GD 2.2091 / Geode 6.0.0-alpha.2. Built from ${GITHUB_SHA}. Drop the .geode into your Geode mods folder."

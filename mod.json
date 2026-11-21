@@ -1,0 +1,118 @@
+{
+	"geode": "6.0.0-alpha.2",
+	"gd": {
+		"win": "2.2091",
+		"mac": "2.2091",
+		"android": "2.2091"
+	},
+	"version": "0.1.0",
+	"id": "p1e2r.pathfinder",
+	"name": "Pathfinder",
+	"developer": "p1e2r",
+	"description": "Searches a classic level for inputs that beat it and exports them as a .gdr macro",
+	"settings": {
+		"toggle_pathfinder": {
+			"type": "keybind",
+			"name": "Start / stop",
+			"description": "Starts or stops the search in the current level.",
+			"default": "Alt+J",
+			"category": "gameplay"
+		},
+		"search-title": {
+			"type": "title",
+			"name": "Search"
+		},
+		"search_window": {
+			"type": "int",
+			"name": "Search window (ticks)",
+			"description": "How far before a death (at 240 ticks per second) the bot tries a new click or release. Raise it for levels where the cause of a death is far earlier.",
+			"default": 60,
+			"min": 4,
+			"max": 960
+		},
+		"search_step": {
+			"type": "int",
+			"name": "Tick step",
+			"description": "Try every Nth tick inside the window. 1 is frame-perfect; 2-3 is faster on easy parts.",
+			"default": 1,
+			"min": 1,
+			"max": 8
+		},
+		"dedupe_deaths": {
+			"type": "bool",
+			"name": "Skip identical deaths",
+			"description": "Don't explore a new input if it dies at exactly the same tick and place as an input already tried. Much faster; turn off if the search gives up on a level it should beat.",
+			"default": true
+		},
+		"exact_mode": {
+			"type": "bool",
+			"name": "Exact mode (slow)",
+			"description": "Rewind by restarting the level and replaying inputs instead of loading snapshots. Every try is bit-exact, but long levels get very slow.",
+			"default": false
+		},
+		"perf-title": {
+			"type": "title",
+			"name": "Performance"
+		},
+		"frame_budget_ms": {
+			"type": "int",
+			"name": "Time per frame (ms)",
+			"description": "How long the search runs each rendered frame. Higher is faster but the game gets choppy.",
+			"default": 14,
+			"min": 1,
+			"max": 200
+		},
+		"snapshot_interval": {
+			"type": "int",
+			"name": "Snapshot every N ticks",
+			"description": "Smaller rewinds faster but uses more memory.",
+			"default": 4,
+			"min": 1,
+			"max": 60
+		},
+		"max_snapshots": {
+			"type": "int",
+			"name": "Max snapshots",
+			"description": "Older snapshots are thinned out past this count.",
+			"default": 400,
+			"min": 16,
+			"max": 5000
+		},
+		"max_repairs": {
+			"type": "int",
+			"name": "Max repairs",
+			"description": "Each found path is replayed from a clean start. If it drifts and dies, the bot searches again from there, up to this many times.",
+			"default": 20,
+			"min": 0,
+			"max": 500
+		},
+		"export-title": {
+			"type": "title",
+			"name": "Export"
+		},
+		"export_folder": {
+			"type": "folder",
+			"name": "Save location",
+			"description": "Same default as xdBot's macro folder, so found paths show up in its Load menu.",
+			"default": "{gd_dir}/macros"
+		},
+		"export_json": {
+			"type": "bool",
+			"name": "Save as .gdr.json",
+			"description": "Write JSON instead of the usual MessagePack .gdr.",
+			"default": false
+		},
+		"seed": {
+			"type": "int",
+			"name": "RNG seed",
+			"description": "Seed for random triggers during the search, stored in the .gdr. Your replay bot must use the same seed on levels with random triggers.",
+			"default": 1,
+			"min": 0,
+			"max": 2147483647
+		}
+	},
+	"links": {
+		"source": "https://github.com/p1e2r/gd-pathfinder"
+	},
+	"tags": ["gameplay", "utility", "cheat"]
+}
